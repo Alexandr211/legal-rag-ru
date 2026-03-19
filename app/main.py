@@ -1,6 +1,11 @@
 from pathlib import Path
 import json
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from typing import Literal
 import uuid
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -50,6 +55,7 @@ class AskRequest(BaseModel):
     doc_id: str | None = None
     include_gk_rf: bool = True
     gk_limit: int = 3
+    llm_provider: Literal["ollama", "openai"] = "ollama"
 
 
 @app.get("/health")
@@ -148,16 +154,19 @@ def ask(payload: AskRequest):
 
     matches = []
     gk_matches = []
-    context_parts = []
+    doc_context_parts = []
+    gk_context_parts = []
 
-    for item in results:
+    for i, item in enumerate(results, start=1):
         text = item.payload.get("text", "")
         filename = item.payload.get("filename")
         chunk_index = item.payload.get("chunk_index")
         doc_id = item.payload.get("doc_id")
+        source_id = f"M{i}"
 
         matches.append(
             {
+                "source_id": source_id,
                 "score": item.score,
                 "doc_id": doc_id,
                 "filename": filename,
@@ -166,8 +175,8 @@ def ask(payload: AskRequest):
             }
         )
 
-        context_parts.append(
-            f"[Файл: {filename}; doc_id: {doc_id}; chunk: {chunk_index}]\n{text}"
+        doc_context_parts.append(
+            f"[{source_id}] [Файл: {filename}; doc_id: {doc_id}; chunk: {chunk_index}]\n{text}"
         )
 
     if payload.include_gk_rf and payload.gk_limit > 0:
@@ -176,14 +185,16 @@ def ask(payload: AskRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"GK RF search failed: {e}")
 
-        for item in gk_results:
+        for i, item in enumerate(gk_results, start=1):
             p = item.payload or {}
             title = p.get("title")
             article = p.get("article")
             text = p.get("text", "")
+            source_id = f"G{i}"
 
             gk_matches.append(
                 {
+                    "source_id": source_id,
                     "score": item.score,
                     "gk_id": p.get("gk_id"),
                     "article": article,
@@ -198,9 +209,9 @@ def ask(payload: AskRequest):
             if title:
                 header += f"; {title}"
             header += "]"
-            context_parts.append(f"{header}\n{text}")
+            gk_context_parts.append(f"[{source_id}] {header}\n{text}")
 
-    if not context_parts:
+    if not doc_context_parts and not gk_context_parts:
         return {
             "question": question,
             "answer": "Не удалось найти релевантные фрагменты в загруженных документах.",
@@ -208,10 +219,25 @@ def ask(payload: AskRequest):
             "gk_matches": gk_matches,
         }
 
-    context = "\n---\n".join(context_parts)
+    context_sections = []
+    if doc_context_parts:
+        context_sections.append(
+            "ИСТОЧНИКИ ДОГОВОРА (используй ссылки [M#]):\n"
+            + "\n\n".join(doc_context_parts)
+        )
+    if gk_context_parts:
+        context_sections.append(
+            "ДОПОЛНИТЕЛЬНЫЙ ИСТОЧНИК: ГК РФ (используй ссылки [G#]):\n"
+            + "\n\n".join(gk_context_parts)
+        )
+    context = "\n\n---\n\n".join(context_sections)
 
     try:
-        answer = generate_answer(question=question, context=context)
+        answer = generate_answer(
+            question=question,
+            context=context,
+            provider=payload.llm_provider,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
@@ -220,6 +246,7 @@ def ask(payload: AskRequest):
         "answer": answer,
         "matches": matches,
         "gk_matches": gk_matches,
+        "llm_provider": payload.llm_provider,
     }
 
 

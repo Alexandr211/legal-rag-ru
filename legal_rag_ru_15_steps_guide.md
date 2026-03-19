@@ -14,7 +14,7 @@
 - разбить на чанки
 - сохранить в Qdrant
 - найти релевантные фрагменты
-- отдать контекст в Ollama
+- отдать контекст в LLM (Ollama или OpenAI)
 - получить структурированный ответ
 
 --------------------------------------------------
@@ -73,7 +73,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install fastapi uvicorn[standard] qdrant-client pydantic python-multipart \
             langchain-text-splitters pypdf docx2txt \
-            sentence-transformers requests
+            sentence-transformers requests openai python-dotenv
 ```
 
 Проверка:
@@ -215,6 +215,8 @@ GK_QDRANT_COLLECTION=gk_rf_ru
 
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:7b
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5-mini
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 DATA_ROOT=/datasets/legal-rag-ru
@@ -404,8 +406,7 @@ def search_chunks(query: str, limit: int = 5):
     return response.points
 ```
 
---------------------------------------------------
-ЭТАП 11. Реализовать работу с Ollama
+ЭТАП 11. Реализовать работу с LLM (Ollama + OpenAI)
 --------------------------------------------------
 
 Файл: `app/llm.py`
@@ -413,9 +414,11 @@ def search_chunks(query: str, limit: int = 5):
 ```python
 import os
 import requests
+from openai import OpenAI
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 SYSTEM_PROMPT = """
 Ты — юридический AI-помощник по российским договорам.
@@ -436,7 +439,7 @@ SYSTEM_PROMPT = """
 """
 
 
-def generate_answer(question: str, context: str) -> str:
+def generate_answer(question: str, context: str, provider: str = "ollama") -> str:
     prompt = f"""{SYSTEM_PROMPT}
 
 КОНТЕКСТ:
@@ -445,6 +448,14 @@ def generate_answer(question: str, context: str) -> str:
 ВОПРОС:
 {question}
 """
+
+    if provider == "openai":
+        client = OpenAI()
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+        return (resp.output_text or "").strip()
 
     response = requests.post(
         f"{OLLAMA_URL}/api/generate",
@@ -460,6 +471,11 @@ def generate_answer(question: str, context: str) -> str:
     return data["response"].strip()
 ```
 
+Примечание:
+- `provider="ollama"` — локальная модель без внешнего API.
+- `provider="openai"` — облачная модель OpenAI (нужен `OPENAI_API_KEY`).
+- Если OpenAI возвращает `403 unsupported_country_region_territory`, это сетевое/региональное ограничение, а не ошибка бизнес-логики приложения.
+
 --------------------------------------------------
 ЭТАП 12. Реализовать FastAPI backend
 --------------------------------------------------
@@ -470,6 +486,7 @@ def generate_answer(question: str, context: str) -> str:
 from pathlib import Path
 import json
 import os
+from typing import Literal
 import uuid
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -501,6 +518,7 @@ class AskRequest(BaseModel):
     doc_id: str | None = None
     include_gk_rf: bool = True
     gk_limit: int = 3
+    llm_provider: Literal["ollama", "openai"] = "ollama"
 
 
 @app.get("/health")
@@ -622,7 +640,11 @@ def ask(payload: AskRequest):
     context = "\n---\n".join(context_parts)
 
     try:
-        answer = generate_answer(question=question, context=context)
+        answer = generate_answer(
+            question=question,
+            context=context,
+            provider=payload.llm_provider,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
@@ -670,11 +692,10 @@ curl -sS http://localhost:8000/gk/health
 ```bash
 cd /workspace/legal-rag-ru
 source .venv/bin/activate
-set -a
-source .env
-set +a
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+`.env` загружается автоматически при старте FastAPI (через `python-dotenv` в `app/main.py`), поэтому ручной `source .env` не обязателен.
 
 Проверка:
 - `http://localhost:8000/health`
@@ -713,12 +734,27 @@ curl -X POST "http://localhost:8000/upload" \
 
 ## Задать вопрос
 
+Через локальную модель Ollama:
+
 ```bash
 curl -X POST "http://localhost:8000/ask" \
   -H "Content-Type: application/json" \
   -d '{
     "question": "Есть ли риск одностороннего расторжения для исполнителя и что стоит изменить?",
-    "limit": 3
+    "limit": 3,
+    "llm_provider": "ollama"
+  }'
+```
+
+Через OpenAI:
+
+```bash
+curl -X POST "http://localhost:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Есть ли риск одностороннего расторжения для исполнителя и что стоит изменить?",
+    "limit": 3,
+    "llm_provider": "openai"
   }'
 ```
 
@@ -780,11 +816,11 @@ EOF
 2. Проверить `docker ps`
 3. Проверить `curl http://localhost:6333/collections`
 4. Проверить `ollama list`
-5. Загрузить `.env`
+5. Проверить `OPENAI_API_KEY` (если используешь OpenAI)
 6. Запустить `uvicorn`
 7. Открыть `/docs`
 8. Загрузить документ
-9. Задать вопрос
+9. Задать вопрос с `llm_provider` (`ollama` или `openai`)
 
 --------------------------------------------------
 КОМАНДЫ ДИАГНОСТИКИ
@@ -831,6 +867,17 @@ ollama pull qwen2.5:7b
 curl http://localhost:8000/health
 ```
 
+Проверка OpenAI-пути:
+
+```bash
+python -c "from dotenv import load_dotenv; load_dotenv(); import os; print(bool(os.getenv('OPENAI_API_KEY')), os.getenv('OPENAI_API_KEY','')[:12])"
+curl -X POST "http://localhost:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Ответь одним словом: тест","llm_provider":"openai","limit":1}'
+```
+
+Если получаешь `403 unsupported_country_region_territory`, проверь маршрут трафика/VPN в том же терминале, где запущен `uvicorn`.
+
 --------------------------------------------------
 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ
 --------------------------------------------------
@@ -841,7 +888,7 @@ curl http://localhost:8000/health
 - нарезка на чанки
 - индексирование в Qdrant
 - семантический поиск
-- генерация ответа через Ollama
+- генерация ответа через Ollama или OpenAI (переключение через `llm_provider`)
 - структура, готовая к переносу на тестовый сервер
 
 Конец инструкции.
