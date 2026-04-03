@@ -878,6 +878,12 @@ curl -X POST "http://localhost:8000/ask" \
 
 Если получаешь `403 unsupported_country_region_territory`, проверь маршрут трафика/VPN в том же терминале, где запущен `uvicorn`.
 
+Запуск uvicorn в проекте:
+
+cd /workspace/legal-rag-ru
+source .venv/bin/activate
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
 --------------------------------------------------
 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ
 --------------------------------------------------

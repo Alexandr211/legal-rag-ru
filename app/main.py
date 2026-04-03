@@ -1,9 +1,62 @@
 from pathlib import Path
 import json
 import os
+import requests
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# Прокси в IDE/терминале иногда заданы некорректно и могут ломать httpx/клиенты
+# (например, через `Invalid port: ':'`). При этом для OpenAI нам важно, чтобы
+# трафик шел через VPN/прокси, поэтому:
+# - SOCKS-прокси удаляем всегда (их часто нельзя корректно обработать).
+# - HTTP/HTTPS-прокси оставляем, но только если они валидны.
+_SOCKS_KEYS = {"SOCKS_PROXY", "SOCKS5_PROXY", "socks_proxy", "socks5_proxy", "ALL_PROXY", "all_proxy"}
+_HTTP_KEYS = {
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+}
+
+def _is_valid_http_proxy(value: str | None) -> bool:
+    if not value:
+        return False
+    value = value.strip()
+    try:
+        u = urlparse(value)
+    except Exception:
+        return False
+    if u.scheme not in {"http", "https"}:
+        return False
+    if not u.hostname:
+        return False
+    # httpx/requests ожидают номер порта
+    if u.port is None:
+        return False
+    return 1 <= int(u.port) <= 65535
+
+# Убираем SOCKS-прокси (часто ломают httpx, либо требуют socks-надстроек).
+for _k in list(_SOCKS_KEYS):
+    os.environ.pop(_k, None)
+
+# Санитизация HTTP/HTTPS-прокси: оставляем только валидные.
+for _k in list(_HTTP_KEYS):
+    _v = os.environ.get(_k)
+    if _k in {"NO_PROXY", "no_proxy"}:
+        continue
+    if _v is None:
+        continue
+    if not _is_valid_http_proxy(_v):
+        os.environ.pop(_k, None)
+
+# Локальные сервисы (Qdrant/Ollama/FastAPI) всегда должны идти напрямую.
+_local_no_proxy = "127.0.0.1,localhost,0.0.0.0,::1"
+os.environ["NO_PROXY"] = _local_no_proxy
+os.environ["no_proxy"] = _local_no_proxy
 
 from typing import Literal
 import uuid
@@ -55,7 +108,7 @@ class AskRequest(BaseModel):
     doc_id: str | None = None
     include_gk_rf: bool = True
     gk_limit: int = 3
-    llm_provider: Literal["ollama", "openai"] = "ollama"
+    llm_provider: Literal["ollama", "openai", "gigachat"] = "ollama"
 
 
 @app.get("/health")
@@ -239,6 +292,32 @@ def ask(payload: AskRequest):
             provider=payload.llm_provider,
         )
     except Exception as e:
+        err_text = str(e)
+        # OpenAI: гео-ограничение возвращается как 403 unsupported_country_region_territory.
+        if payload.llm_provider == "openai" and "unsupported_country_region_territory" in err_text:
+            llm_request_ip = None
+            llm_request_country = None
+            try:
+                # IP определяется с той же стороны сервера, с которой идёт запрос в OpenAI.
+                resp = requests.get("https://ipinfo.io/json", timeout=5)
+                resp.raise_for_status()
+                data = resp.json() or {}
+                llm_request_ip = data.get("ip")
+                llm_request_country = data.get("country")
+            except Exception:
+                pass
+
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "LLM generation failed",
+                    "provider": payload.llm_provider,
+                    "openai_error": err_text,
+                    "llm_request_ip": llm_request_ip,
+                    "llm_request_country": llm_request_country,
+                },
+            )
+
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
     return {

@@ -1,7 +1,11 @@
 import os
 import re
+import time
+import uuid
+import threading
 
 import requests
+import httpx
 from openai import OpenAI
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -11,6 +15,31 @@ OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "1"))
 _OLLAMA_SEED_RAW = os.getenv("OLLAMA_SEED", "").strip()
 OLLAMA_SEED = int(_OLLAMA_SEED_RAW) if _OLLAMA_SEED_RAW else None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
+GIGACHAT_AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY", "")
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru/api/v1")
+GIGACHAT_OAUTH_URL = os.getenv(
+    "GIGACHAT_OAUTH_URL",
+    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+)
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
+GIGACHAT_VERIFY_SSL_CERTS = (os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "true") or "").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+GIGACHAT_CA_BUNDLE_FILE = (os.getenv("GIGACHAT_CA_BUNDLE_FILE", "") or "").strip()
+
+
+def _gigachat_verify_param() -> bool | str:
+    if GIGACHAT_CA_BUNDLE_FILE:
+        return GIGACHAT_CA_BUNDLE_FILE
+    return GIGACHAT_VERIFY_SSL_CERTS
+
+_GIGACHAT_ACCESS_TOKEN: str | None = None
+_GIGACHAT_EXPIRES_AT: int = 0
+_GIGACHAT_LOCK = threading.Lock()
 
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
@@ -94,6 +123,78 @@ def _generate_with_openai(prompt: str) -> str:
     raise RuntimeError("OpenAI Responses API returned empty output_text")
 
 
+def _get_gigachat_access_token() -> str:
+    """
+    GigaChat OAuth token is short-lived (30 minutes).
+    Cache it in-memory to avoid requesting it on every /ask call.
+    """
+    auth_key = (GIGACHAT_AUTHORIZATION_KEY or "").strip()
+    if not auth_key:
+        raise RuntimeError("GIGACHAT_AUTHORIZATION_KEY is not set")
+
+    global _GIGACHAT_ACCESS_TOKEN, _GIGACHAT_EXPIRES_AT
+
+    now = int(time.time())
+    # Reuse token while it's still valid for at least 60s.
+    if _GIGACHAT_ACCESS_TOKEN is not None and (_GIGACHAT_EXPIRES_AT - now) > 60:
+        return _GIGACHAT_ACCESS_TOKEN
+
+    with _GIGACHAT_LOCK:
+        now = int(time.time())
+        if _GIGACHAT_ACCESS_TOKEN is not None and (_GIGACHAT_EXPIRES_AT - now) > 60:
+            return _GIGACHAT_ACCESS_TOKEN
+
+        rq_uid = str(uuid.uuid4())
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": rq_uid,
+            "Authorization": f"Basic {auth_key}",
+        }
+        resp = requests.post(
+            GIGACHAT_OAUTH_URL,
+            headers=headers,
+            data={"scope": GIGACHAT_SCOPE},
+            timeout=30,
+            verify=_gigachat_verify_param(),
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        access_token = (data.get("access_token") or "").strip()
+        expires_at = int(data.get("expires_at") or 0)
+
+        if not access_token or expires_at <= 0:
+            # Fallback: assume 30 minutes from now if expires_at missing.
+            expires_at = now + 30 * 60
+
+        _GIGACHAT_ACCESS_TOKEN = access_token
+        _GIGACHAT_EXPIRES_AT = expires_at
+        return _GIGACHAT_ACCESS_TOKEN
+
+
+def _generate_with_gigachat(prompt: str) -> str:
+    access_token = _get_gigachat_access_token()
+
+    # GigaChat provides OpenAI-compatible API via base_url.
+    verify_param = _gigachat_verify_param()
+    http_client = httpx.Client(verify=verify_param, timeout=60)
+    client = OpenAI(api_key=access_token, base_url=GIGACHAT_BASE_URL, http_client=http_client)
+    response = client.chat.completions.create(
+        model=GIGACHAT_MODEL,
+        messages=[
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = (
+        response.choices[0].message.content
+        if response.choices
+        else None
+    )
+    if text:
+        return text.strip()
+    raise RuntimeError("GigaChat chat.completions returned empty content")
+
+
 def generate_answer(
     question: str,
     context: str,
@@ -104,5 +205,7 @@ def generate_answer(
     provider_norm = (provider or "ollama").lower().strip()
     if provider_norm == "openai":
         return _generate_with_openai(prompt)
+    if provider_norm == "gigachat":
+        return _generate_with_gigachat(prompt)
     return _generate_with_ollama(prompt)
 

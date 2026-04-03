@@ -17,7 +17,9 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "legal_docs_ru")
 GK_QDRANT_COLLECTION = os.getenv("GK_QDRANT_COLLECTION", "gk_rf_ru")
 
-client = QdrantClient(url=QDRANT_URL)
+# Qdrant использует httpx, который по умолчанию читает прокси из env.
+# В некоторых терминальных окружениях это приводит к падению при парсинге proxy-URL.
+client = QdrantClient(url=QDRANT_URL, trust_env=False)
 
 
 def ensure_collection(*, collection_name: str, vector_size: int = 384) -> None:
