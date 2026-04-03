@@ -1,49 +1,29 @@
-# Legal RAG RU — подробная инструкция по реализации в 15 этапов
+# Legal RAG RU — инструкция по реализации в 15 этапов
 
 Проект: локальный RAG-сервис для разбора юридических документов на Ubuntu 24.04.
 
-Архитектура:
-- код проекта: `/workspace/legal-rag-ru`
-- данные проекта: `/datasets/legal-rag-ru`
-- Docker runtime: `/docker`
-- домашний каталог: только пользовательские настройки
+**Архитектура (фактическая):**
+- код: `/workspace/legal-rag-ru`
+- данные: `/datasets/legal-rag-ru` (или пути из `.env`)
+- Docker: Qdrant по желанию
+- Ollama: локальные LLM
 
-Цель MVP:
-- загрузить PDF / DOCX / TXT
-- извлечь текст
-- разбить на чанки
-- сохранить в Qdrant
-- найти релевантные фрагменты
-- отдать контекст в LLM (Ollama или OpenAI)
-- получить структурированный ответ
+**Цель MVP:** загрузка PDF/DOCX/TXT → извлечение текста → чанки → Qdrant → семантический поиск → контекст в LLM → структурированный ответ с опорой на источники; опционально подмешиваются фрагменты ГК РФ из отдельной коллекции.
 
---------------------------------------------------
-ЭТАП 1. Подготовить окружение и правильно разложить проект по разделам
---------------------------------------------------
+**Где смотреть код:** модули в `app/` (`main.py`, `extractors.py`, `chunking.py`, `embeddings.py`, `vectorstore.py`, `llm.py`, `metadata_store.py`), скрипты в `scripts/`. Ниже — описание этапов, **команды терминала** и проверки; без дублирования полных исходников приложения.
 
-## Целевая схема
+---
 
-Код:
-`/workspace/legal-rag-ru`
+## Этап 1. Окружение и раскладка каталогов
 
-Данные:
-`/datasets/legal-rag-ru`
-
-Подкаталоги данных:
-- `/datasets/legal-rag-ru/qdrant`
-- `/datasets/legal-rag-ru/uploads`
-- `/datasets/legal-rag-ru/processed`
-- `/datasets/legal-rag-ru/ollama`
-- `/datasets/legal-rag-ru/logs`
-
-## Установить базовые пакеты
+Установить базовые пакеты и создать каталоги данных.
 
 ```bash
 sudo apt update
 sudo apt install -y git curl python3 python3-venv python3-pip ca-certificates
 ```
 
-Если Docker еще не установлен:
+Docker для Qdrant (если ещё не установлен):
 
 ```bash
 sudo apt install -y docker.io docker-compose-v2
@@ -52,19 +32,21 @@ sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-## Создать каталоги
+Каталоги проекта и данных (пути при необходимости замените):
 
 ```bash
 sudo mkdir -p /workspace/legal-rag-ru
 sudo chown -R $USER:$USER /workspace/legal-rag-ru
 
-sudo mkdir -p /datasets/legal-rag-ru/{qdrant,uploads,processed,ollama,logs}
+sudo mkdir -p /datasets/legal-rag-ru/{qdrant,uploads,processed,ollama,logs,gk_rf}
 sudo chown -R $USER:$USER /datasets/legal-rag-ru
 ```
 
---------------------------------------------------
-ЭТАП 2. Создать Python-окружение и поставить зависимости
---------------------------------------------------
+**Проверка:** каталоги существуют, владелец совпадает с пользователем запуска.
+
+---
+
+## Этап 2. Python-окружение и зависимости
 
 ```bash
 cd /workspace/legal-rag-ru
@@ -73,28 +55,23 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install fastapi uvicorn[standard] qdrant-client pydantic python-multipart \
             langchain-text-splitters pypdf docx2txt \
-            sentence-transformers requests openai python-dotenv
+            sentence-transformers requests openai python-dotenv httpx
 ```
 
-Проверка:
+**Проверка:**
 
 ```bash
 which python
 which pip
 ```
 
-Ожидаемо:
+Ожидаемо: `/workspace/legal-rag-ru/.venv/bin/python` и `.../pip`.
 
-```bash
-/workspace/legal-rag-ru/.venv/bin/python
-/workspace/legal-rag-ru/.venv/bin/pip
-```
+---
 
---------------------------------------------------
-ЭТАП 3. Поднять Qdrant в Docker
---------------------------------------------------
+## Этап 3. Qdrant
 
-Qdrant отдельно в систему не устанавливаем. Docker сам скачивает image и запускает контейнер.
+Запуск в Docker (том на диск данных, порт 6333):
 
 ```bash
 docker run -d \
@@ -105,108 +82,65 @@ docker run -d \
   qdrant/qdrant
 ```
 
-Проверка:
+Имя коллекции для договоров — `QDRANT_COLLECTION`; для ГК РФ — `GK_QDRANT_COLLECTION` (в `.env`).
+
+**Проверка:**
 
 ```bash
-curl http://localhost:6333/collections
+curl -sS http://localhost:6333/collections
+docker ps
 ```
 
---------------------------------------------------
-ЭТАП 4. Установить Ollama и привязать модели к /datasets
---------------------------------------------------
+---
 
-## Установка Ollama
+## Этап 4. Ollama (локальные модели)
+
+Установка:
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-Проверка:
+Опционально: привязать каталог моделей к `/datasets` (через override systemd, переменная `OLLAMA_MODELS`), затем:
+
+```bash
+ollama pull qwen2.5:7b
+# или другая модель, например:
+# ollama pull llama3.1:8b
+```
+
+Активная модель для приложения задаётся в `.env` как `OLLAMA_MODEL` (см. `app/llm.py`).
+
+**Проверка:**
 
 ```bash
 which ollama
 ollama --version
-```
-
-## Привязать systemd-сервис Ollama к `/datasets/legal-rag-ru/ollama`
-
-```bash
-sudo mkdir -p /etc/systemd/system/ollama.service.d
-sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'EOF'
-[Service]
-Environment="OLLAMA_MODELS=/datasets/legal-rag-ru/ollama"
-EOF
-
-sudo chown -R ollama:ollama /datasets/legal-rag-ru/ollama
-sudo chmod 755 /datasets/legal-rag-ru/ollama
-sudo systemctl daemon-reload
-sudo systemctl restart ollama
-sudo systemctl show ollama --property=Environment --no-pager
-```
-
-Ожидаемо в выводе:
-
-```text
-OLLAMA_MODELS=/datasets/legal-rag-ru/ollama
-```
-
-## Скачать модель
-
-```bash
-ollama pull qwen2.5:7b
-```
-
-Проверка:
-
-```bash
 ollama list
-sudo du -sh /datasets/legal-rag-ru/ollama
+curl -sS http://localhost:11434/api/tags
 ```
 
---------------------------------------------------
-ЭТАП 5. Создать структуру проекта
---------------------------------------------------
+---
+
+## Этап 5. Структура проекта
 
 ```bash
 cd /workspace/legal-rag-ru
 mkdir -p app scripts tests
-touch .env README.md
-```
-
-Итоговая структура:
-
-```text
-/workspace/legal-rag-ru/
-├── .venv/
-├── app/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── extractors.py
-│   ├── chunking.py
-│   ├── embeddings.py
-│   ├── vectorstore.py
-│   ├── llm.py
-│   └── metadata_store.py
-├── scripts/
-│   ├── fetch_gk_rf.py
-│   ├── parse_gk_rf_txt.py
-│   └── index_gk_rf.py
-├── tests/
-├── .env
-└── README.md
-```
-
-Создай пустой `__init__.py`:
-
-```bash
 touch app/__init__.py
 ```
 
---------------------------------------------------
-ЭТАП 6. Создать .env
---------------------------------------------------
+Ожидаемая логика: `app/` — API и логика RAG; `scripts/` — ГК РФ; `tests/` — тесты.
 
-Содержимое файла `/workspace/legal-rag-ru/.env`:
+**Проверка:** после клонирования/копирования кода запуск uvicorn (этап 13) не падает на импортах.
+
+---
+
+## Этап 6. Файл `.env`
+
+Переменные подхватываются при старте (`load_dotenv()` в `app/main.py`). Создайте `/workspace/legal-rag-ru/.env` и задайте переменные; **секреты не коммитить**.
+
+Пример структуры (значения подставьте свои):
 
 ```env
 QDRANT_URL=http://localhost:6333
@@ -215,8 +149,9 @@ GK_QDRANT_COLLECTION=gk_rf_ru
 
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:7b
-OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5-mini
+OPENAI_API_KEY=
+
 EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 DATA_ROOT=/datasets/legal-rag-ru
@@ -224,470 +159,76 @@ UPLOAD_DIR=/datasets/legal-rag-ru/uploads
 PROCESSED_DIR=/datasets/legal-rag-ru/processed
 LOG_DIR=/datasets/legal-rag-ru/logs
 GK_RF_DIR=/datasets/legal-rag-ru/gk_rf
+
+# GigaChat (если llm_provider=gigachat)
+GIGACHAT_AUTHORIZATION_KEY=
+GIGACHAT_SCOPE=GIGACHAT_API_PERS
+GIGACHAT_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
+GIGACHAT_OAUTH_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+GIGACHAT_MODEL=GigaChat
+GIGACHAT_VERIFY_SSL_CERTS=true
+GIGACHAT_CA_BUNDLE_FILE=
 ```
 
---------------------------------------------------
-ЭТАП 7. Реализовать извлечение текста
---------------------------------------------------
+Дополнительно для Ollama в `app/llm.py` могут использоваться `OLLAMA_TEMPERATURE`, `OLLAMA_TOP_P`, `OLLAMA_SEED`.
 
-Файл: `app/extractors.py`
+**Проверка:** после правки `.env` перезапустить uvicorn; при смене модели — `ollama list` содержит `OLLAMA_MODEL`.
 
-```python
-from pathlib import Path
-import tempfile
-import os
+---
 
-import pypdf
-import docx2txt
+## Этап 7. Извлечение текста
 
+Реализовано в `app/extractors.py` (PDF, DOCX, TXT).
 
-def extract_text_from_pdf(path: str) -> str:
-    reader = pypdf.PdfReader(path)
-    parts: list[str] = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    return "\n".join(parts).strip()
+**Проверка:** через `POST /upload` после запуска API (этап 13–14).
 
+---
 
-def extract_text_from_docx(path: str) -> str:
-    return (docx2txt.process(path) or "").strip()
+## Этап 8. Чанкинг
 
+Реализовано в `app/chunking.py`.
 
-def extract_text_from_txt(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read().strip()
+**Проверка:** косвенно — успешная индексация после upload и ответ `/ask`.
 
+---
 
-def extract_text(filename: str, content: bytes) -> str:
-    suffix = Path(filename).suffix.lower()
+## Этап 9. Эмбеддинги
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+Реализовано в `app/embeddings.py`, модель из `EMBED_MODEL`.
 
-    try:
-        if suffix == ".pdf":
-            return extract_text_from_pdf(tmp_path)
-        if suffix == ".docx":
-            return extract_text_from_docx(tmp_path)
-        if suffix == ".txt":
-            return extract_text_from_txt(tmp_path)
-        raise ValueError(f"Unsupported file type: {suffix}")
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-```
+**Проверка:** первый успешный `POST /upload` подтянет модель эмбеддингов (может занять время).
 
---------------------------------------------------
-ЭТАП 8. Реализовать нарезку текста на чанки
---------------------------------------------------
+---
 
-Файл: `app/chunking.py`
+## Этап 10. Qdrant: индексация и поиск
 
-```python
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+Реализовано в `app/vectorstore.py`: коллекция договоров, поиск, отдельно ГК РФ и `gk_health`.
 
+**Проверка:** см. этапы 13–15 и curl к `/ask`, `/gk/health`.
 
-def split_text(text: str) -> list[str]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ".", " ", ""],
-    )
-    chunks = splitter.split_text(text)
-    return [chunk.strip() for chunk in chunks if chunk.strip()]
-```
+---
 
---------------------------------------------------
-ЭТАП 9. Реализовать эмбеддинги
---------------------------------------------------
+## Этап 11. LLM: провайдеры и промпт
 
-Файл: `app/embeddings.py`
+Реализовано в `app/llm.py`: `ollama`, `openai`, `gigachat`; ссылки на источники `[M#]` / `[G#]`.
 
-```python
-import os
-from sentence_transformers import SentenceTransformer
-
-_model = None
-
-
-def get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        model_name = os.getenv(
-            "EMBED_MODEL",
-            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        )
-        _model = SentenceTransformer(model_name)
-    return _model
-
-
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    model = get_model()
-    vectors = model.encode(texts, normalize_embeddings=True)
-    return vectors.tolist()
-
-
-def embed_query(text: str) -> list[float]:
-    model = get_model()
-    vector = model.encode([text], normalize_embeddings=True)[0]
-    return vector.tolist()
-```
-
---------------------------------------------------
-ЭТАП 10. Реализовать Qdrant vector store
---------------------------------------------------
-
-Файл: `app/vectorstore.py`
-
-```python
-import os
-import uuid
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-
-from app.embeddings import embed_texts, embed_query
-
-
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "legal_docs_ru")
-
-client = QdrantClient(url=QDRANT_URL)
-
-
-def ensure_collection(vector_size: int = 384) -> None:
-    collections = client.get_collections().collections
-    existing_names = [c.name for c in collections]
-
-    if QDRANT_COLLECTION not in existing_names:
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
-
-
-def index_chunks(doc_id: str, filename: str, chunks: list[str]) -> int:
-    if not chunks:
-        return 0
-
-    vectors = embed_texts(chunks)
-    vector_size = len(vectors[0])
-    ensure_collection(vector_size=vector_size)
-
-    points = []
-    for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
-        points.append(
-            PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload={
-                    "doc_id": doc_id,
-                    "filename": filename,
-                    "chunk_index": i,
-                    "text": chunk,
-                },
-            )
-        )
-
-    client.upsert(collection_name=QDRANT_COLLECTION, points=points)
-    return len(points)
-
-
-def search_chunks(query: str, limit: int = 5):
-    # В qdrant-client>=1.17 используется `query_points` (метода `search` нет).
-    query_vector = embed_query(query)
-    ensure_collection(vector_size=len(query_vector))
-    response = client.query_points(
-        collection_name=QDRANT_COLLECTION,
-        query=query_vector,
-        limit=limit,
-        with_payload=True,
-    )
-    return response.points
-```
-
-ЭТАП 11. Реализовать работу с LLM (Ollama + OpenAI)
---------------------------------------------------
-
-Файл: `app/llm.py`
-
-```python
-import os
-import requests
-from openai import OpenAI
-
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-
-SYSTEM_PROMPT = """
-Ты — юридический AI-помощник по российским договорам.
-
-Правила:
-1. Отвечай только на основе переданного контекста.
-2. Не выдумывай факты, которых нет в контексте.
-3. Если данных недостаточно, прямо скажи об этом.
-4. Язык ответа должен совпадать с языком вопроса.
-5. Ответ делай структурированным.
-
-Формат ответа:
-1. Краткий вывод
-2. Что найдено в документе
-3. Риски для стороны
-4. Что стоит изменить
-5. Ограничение ответа
-"""
-
-
-def generate_answer(question: str, context: str, provider: str = "ollama") -> str:
-    prompt = f"""{SYSTEM_PROMPT}
-
-КОНТЕКСТ:
-{context}
-
-ВОПРОС:
-{question}
-"""
-
-    if provider == "openai":
-        client = OpenAI()
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-        )
-        return (resp.output_text or "").strip()
-
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=180,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["response"].strip()
-```
-
-Примечание:
-- `provider="ollama"` — локальная модель без внешнего API.
-- `provider="openai"` — облачная модель OpenAI (нужен `OPENAI_API_KEY`).
-- Если OpenAI возвращает `403 unsupported_country_region_territory`, это сетевое/региональное ограничение, а не ошибка бизнес-логики приложения.
-
---------------------------------------------------
-ЭТАП 12. Реализовать FastAPI backend
---------------------------------------------------
-
-Файл: `app/main.py`
-
-```python
-from pathlib import Path
-import json
-import os
-from typing import Literal
-import uuid
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-
-from app.extractors import extract_text
-from app.chunking import split_text
-from app.vectorstore import index_chunks, search_chunks
-from app.llm import generate_answer
-
-
-APP_TITLE = "Legal RAG RU"
-
-DATA_ROOT = Path(os.getenv("DATA_ROOT", "/datasets/legal-rag-ru"))
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(DATA_ROOT / "uploads")))
-PROCESSED_DIR = Path(os.getenv("PROCESSED_DIR", str(DATA_ROOT / "processed")))
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
-
-app = FastAPI(title=APP_TITLE)
-
-
-class AskRequest(BaseModel):
-    question: str
-    limit: int = 5
-    doc_id: str | None = None
-    include_gk_rf: bool = True
-    gk_limit: int = 3
-    llm_provider: Literal["ollama", "openai"] = "ollama"
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "app": APP_TITLE,
-        "upload_dir": str(UPLOAD_DIR),
-        "processed_dir": str(PROCESSED_DIR),
-    }
-
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    ext = Path(file.filename).suffix.lower()
-
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {ext}. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
-        )
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    doc_id = str(uuid.uuid4())
-    safe_name = Path(file.filename).name
-
-    original_path = UPLOAD_DIR / f"{doc_id}_{safe_name}"
-    with open(original_path, "wb") as f:
-        f.write(content)
-
-    try:
-        text = extract_text(safe_name, content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Text extraction failed: {e}")
-
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from file")
-
-    extracted_path = PROCESSED_DIR / f"{doc_id}.txt"
-    with open(extracted_path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-    chunks = split_text(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="Could not split text into chunks")
-
-    chunks_path = PROCESSED_DIR / f"{doc_id}.chunks.json"
-    with open(chunks_path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-
-    try:
-        indexed_count = index_chunks(doc_id=doc_id, filename=safe_name, chunks=chunks)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {e}")
-
-    return {
-        "doc_id": doc_id,
-        "filename": safe_name,
-        "original_path": str(original_path),
-        "extracted_text_path": str(extracted_path),
-        "chunks_path": str(chunks_path),
-        "chars": len(text),
-        "chunks_count": len(chunks),
-        "indexed_count": indexed_count,
-        "preview": text[:1000],
-    }
-
-
-@app.post("/ask")
-def ask(payload: AskRequest):
-    question = payload.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question is empty")
-
-    try:
-        results = search_chunks(question, limit=payload.limit, doc_id=payload.doc_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
-
-    matches = []
-    gk_matches = []
-    context_parts = []
-
-    for item in results:
-        text = item.payload.get("text", "")
-        filename = item.payload.get("filename")
-        chunk_index = item.payload.get("chunk_index")
-        doc_id = item.payload.get("doc_id")
-
-        matches.append(
-            {
-                "score": item.score,
-                "doc_id": doc_id,
-                "filename": filename,
-                "chunk_index": chunk_index,
-                "text": text,
-            }
-        )
-
-        context_parts.append(
-            f"[Файл: {filename}; doc_id: {doc_id}; chunk: {chunk_index}]\n{text}"
-        )
-
-    # В текущей версии проекта дополнительно подтягиваем релевантные фрагменты ГК РФ
-    # из отдельной коллекции `GK_QDRANT_COLLECTION` и кладём их в контекст, а также
-    # возвращаем отдельным массивом `gk_matches` (см. реализацию в `app/main.py`).
-
-    if not context_parts:
-        return {
-            "question": question,
-            "answer": "Не удалось найти релевантные фрагменты в загруженных документах.",
-            "matches": [],
-            "gk_matches": gk_matches,
-        }
-
-    context = "\n---\n".join(context_parts)
-
-    try:
-        answer = generate_answer(
-            question=question,
-            context=context,
-            provider=payload.llm_provider,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
-
-    return {
-        "question": question,
-        "answer": answer,
-        "matches": matches,
-        "gk_matches": gk_matches,
-    }
-```
-
-### Дополнительные эндпоинты (реализованы в проекте)
-- `GET /documents` — список загруженных договоров (`doc_id`, `filename`), лимит 50
-- `GET /documents/{doc_id}` — полные метаданные договора
-- `GET /gk/health` — диагностика коллекции ГК РФ (существует ли и сколько в ней точек)
-
-### Хранение метаданных документов (реализовано)
-Метаданные загрузок пишутся в SQLite:
-`/datasets/legal-rag-ru/processed/metadata.sqlite`
-
-### Подключение справочной базы ГК РФ (вариант 1 — отдельная коллекция, реализовано)
-Идея: индексировать ГК РФ в отдельную коллекцию Qdrant (`GK_QDRANT_COLLECTION`) и при `/ask`
-опционально подмешивать найденные фрагменты в контекст.
-
-1) Подготовить файлы (папка `GK_RF_DIR`):
-- `scripts/fetch_gk_rf.py --local-raw` — парсит существующие `*.html/*.htm` из `GK_RF_DIR/raw_html/`
-- `scripts/parse_gk_rf_txt.py ...` — парсит локальные TXT частей I–IV
-
-2) Индексация в Qdrant:
+Проверка OpenAI-ключа локально (опционально):
 
 ```bash
-python scripts/index_gk_rf.py
+python -c "from dotenv import load_dotenv; load_dotenv(); import os; print(bool(os.getenv('OPENAI_API_KEY')))"
 ```
 
-3) Проверка:
+Если OpenAI возвращает `403 unsupported_country_region_territory`, проверьте VPN/маршрут в том же окружении, где запущен uvicorn.
 
-```bash
-curl -sS http://localhost:8000/gk/health
-```
+---
 
---------------------------------------------------
-ЭТАП 13. Запустить проект локально
---------------------------------------------------
+## Этап 12. FastAPI: эндпоинты
+
+Реализовано в `app/main.py`: `/health`, `/upload`, `/ask`, `/documents`, `/documents/{doc_id}`, `/gk/health`; провайдер LLM — поле `llm_provider` в теле `POST /ask`.
+
+---
+
+## Этап 13. Запуск локально
 
 ```bash
 cd /workspace/legal-rag-ru
@@ -695,17 +236,21 @@ source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-`.env` загружается автоматически при старте FastAPI (через `python-dotenv` в `app/main.py`), поэтому ручной `source .env` не обязателен.
+`.env` подхватывается при старте приложения, отдельный `source .env` не обязателен.
 
-Проверка:
-- `http://localhost:8000/health`
-- `http://localhost:8000/docs`
+**Проверка:**
 
---------------------------------------------------
-ЭТАП 14. Прогнать тестовый сценарий
---------------------------------------------------
+```bash
+curl -sS http://localhost:8000/health
+```
 
-## Создать тестовый договор
+Откройте в браузере: `http://localhost:8000/docs`.
+
+---
+
+## Этап 14. Тестовый сценарий
+
+Создать тестовый договор:
 
 ```bash
 cat > /tmp/test_contract.txt <<'EOF'
@@ -725,19 +270,17 @@ cat > /tmp/test_contract.txt <<'EOF'
 EOF
 ```
 
-## Загрузить файл
+Загрузка:
 
 ```bash
-curl -X POST "http://localhost:8000/upload" \
+curl -sS -X POST "http://localhost:8000/upload" \
   -F "file=@/tmp/test_contract.txt"
 ```
 
-## Задать вопрос
-
-Через локальную модель Ollama:
+Вопрос (Ollama):
 
 ```bash
-curl -X POST "http://localhost:8000/ask" \
+curl -sS -X POST "http://localhost:8000/ask" \
   -H "Content-Type: application/json" \
   -d '{
     "question": "Есть ли риск одностороннего расторжения для исполнителя и что стоит изменить?",
@@ -746,10 +289,10 @@ curl -X POST "http://localhost:8000/ask" \
   }'
 ```
 
-Через OpenAI:
+OpenAI:
 
 ```bash
-curl -X POST "http://localhost:8000/ask" \
+curl -sS -X POST "http://localhost:8000/ask" \
   -H "Content-Type: application/json" \
   -d '{
     "question": "Есть ли риск одностороннего расторжения для исполнителя и что стоит изменить?",
@@ -758,144 +301,79 @@ curl -X POST "http://localhost:8000/ask" \
   }'
 ```
 
-## Что должно получиться
+---
 
-Сервис должен вернуть:
-- краткий вывод
-- найденные фрагменты
-- риск для исполнителя
-- рекомендацию добавить уведомление / компенсацию
-- оговорку, что ответ основан только на тексте документа
+## Этап 15. ГК РФ как отдельная коллекция
 
---------------------------------------------------
-ЭТАП 15. Что улучшать после MVP
---------------------------------------------------
+Подготовка данных в `GK_RF_DIR` (см. `scripts/fetch_gk_rf.py`, `scripts/parse_gk_rf_txt.py` при необходимости).
 
-После того как базовый MVP заработал, следующая очередь работ такая:
-
-1. Фильтрация вопросов по конкретному `doc_id`
-2. Хранение метаданных документа
-3. UI поверх API
-4. Выделение рисковых пунктов по типам
-5. Более точная чанкизация по разделам договора
-6. Подключение справочной базы по ГК РФ
-7. Логирование запросов и ответов
-8. Docker Compose для полного запуска
-9. Reverse proxy через Nginx
-10. Перенос на тестовый сервер Ubuntu 24.04
-
---------------------------------------------------
-ГОТОВЫЙ КАРКАС ПРОЕКТА ДЛЯ БЫСТРОГО СОЗДАНИЯ
---------------------------------------------------
-
-Создание файлов одной командой:
+Индексация в Qdrant:
 
 ```bash
 cd /workspace/legal-rag-ru
-mkdir -p app scripts tests
-cat > app/__init__.py <<'EOF'
-EOF
+source .venv/bin/activate
+python scripts/index_gk_rf.py
 ```
 
-Потом по очереди создай файлы:
-- `app/extractors.py`
-- `app/chunking.py`
-- `app/embeddings.py`
-- `app/vectorstore.py`
-- `app/llm.py`
-- `app/main.py`
-- `.env`
+**Проверка:**
 
-и вставь содержимое из этапов выше.
+```bash
+curl -sS http://localhost:8000/gk/health
+```
 
---------------------------------------------------
-КОРОТКИЙ ЧЕК-ЛИСТ ЗАПУСКА
---------------------------------------------------
+В `POST /ask` используйте `include_gk_rf` и при необходимости `gk_limit`; для GigaChat — `"llm_provider": "gigachat"`.
 
-1. Активировать `.venv`
-2. Проверить `docker ps`
-3. Проверить `curl http://localhost:6333/collections`
-4. Проверить `ollama list`
-5. Проверить `OPENAI_API_KEY` (если используешь OpenAI)
-6. Запустить `uvicorn`
-7. Открыть `/docs`
-8. Загрузить документ
-9. Задать вопрос с `llm_provider` (`ollama` или `openai`)
+---
 
---------------------------------------------------
-КОМАНДЫ ДИАГНОСТИКИ
---------------------------------------------------
+## После MVP: типичные улучшения
 
-Проверка Qdrant:
+1. Фильтрация вопросов по `doc_id`.
+2. Расширение метаданных и аудит загрузок.
+3. Веб-UI поверх API.
+4. Типизация рисков по пунктам договора.
+5. Уточнение чанкизации по структуре договора.
+6. Расширение справочных баз (не только ГК РФ).
+7. Логирование запросов и ответов.
+8. Docker Compose для полного запуска.
+9. Reverse proxy через Nginx.
+10. Перенос на тестовый сервер Ubuntu 24.04.
+
+---
+
+## Диагностика (команды)
+
+Qdrant:
 
 ```bash
 docker start qdrant
-curl http://localhost:6333/collections
+curl -sS http://localhost:6333/collections
 docker ps
 docker logs qdrant
 ```
 
-Если контейнера `qdrant` ещё нет (первый запуск):
-
-```bash
-docker run -d \
-  --name qdrant \
-  -p 6333:6333 \
-  -p 6334:6334 \
-  -v /datasets/legal-rag-ru/qdrant:/qdrant/storage \
-  qdrant/qdrant
-```
-
-Проверка Ollama:
+Ollama:
 
 ```bash
 sudo systemctl start ollama
 ollama list
 systemctl status ollama --no-pager
-curl http://localhost:11434/api/tags
+curl -sS http://localhost:11434/api/tags
 ```
 
-Если список моделей пустой:
+API:
 
 ```bash
-ollama pull qwen2.5:7b
+curl -sS http://localhost:8000/health
 ```
 
-Проверка API:
+OpenAI-путь:
 
 ```bash
-curl http://localhost:8000/health
-```
-
-Проверка OpenAI-пути:
-
-```bash
-python -c "from dotenv import load_dotenv; load_dotenv(); import os; print(bool(os.getenv('OPENAI_API_KEY')), os.getenv('OPENAI_API_KEY','')[:12])"
-curl -X POST "http://localhost:8000/ask" \
+curl -sS -X POST "http://localhost:8000/ask" \
   -H "Content-Type: application/json" \
   -d '{"question":"Ответь одним словом: тест","llm_provider":"openai","limit":1}'
 ```
 
-Если получаешь `403 unsupported_country_region_territory`, проверь маршрут трафика/VPN в том же терминале, где запущен `uvicorn`.
-
-Запуск uvicorn в проекте:
-
-cd /workspace/legal-rag-ru
-source .venv/bin/activate
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
---------------------------------------------------
-ФИНАЛЬНЫЙ РЕЗУЛЬТАТ
---------------------------------------------------
-
-После выполнения всех 15 этапов у тебя будет рабочий локальный MVP Legal RAG RU:
-- загрузка юридических документов
-- извлечение текста
-- нарезка на чанки
-- индексирование в Qdrant
-- семантический поиск
-- генерация ответа через Ollama или OpenAI (переключение через `llm_provider`)
-- структура, готовая к переносу на тестовый сервер
+---
 
 Конец инструкции.
-
